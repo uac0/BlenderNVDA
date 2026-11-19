@@ -76,12 +76,26 @@ typedef bool (*pfn_block_is_popup_any)(const void* block);
 typedef bool (*pfn_block_is_menu)(const void* block);
 typedef void* (*pfn_CTX_wm_region_popup)(const void* C);
 typedef void* (*pfn_CTX_wm_area)(const void* C);
+typedef void* (*pfn_CTX_wm_window)(const void* C);
+typedef void (*pfn_button_to_pixelrect)(BlenderRcti* rect, const void* region, const void* block, const void* but);
+typedef void (*pfn_button_string_get)(void* but, char* str, size_t str_maxncpy);
+typedef void (*pfn_draw_aligned_panel)(
+    const void* region,
+    const void* style,
+    const void* block,
+    const BlenderRcti* rect,
+    bool show_pin,
+    bool show_background,
+    bool region_search_filter_active);
+typedef void (*pfn_file_draw_list)(const void* C, void* region);
 
 pfn_BLF_draw                        g_orig_BLF_draw = nullptr;
 pfn_BLF_draw_mono                   g_orig_BLF_draw_mono = nullptr;
 pfn_draw_button                     g_orig_draw_button = nullptr;
 pfn_draw_menu_item                  g_orig_draw_menu_item = nullptr;
 pfn_button_activate_over            g_orig_button_activate_over = nullptr;
+pfn_draw_aligned_panel              g_orig_draw_aligned_panel = nullptr;
+pfn_file_draw_list                  g_orig_file_draw_list = nullptr;
 
 pfn_button_string_get_label         g_fn_button_string_get_label = nullptr;
 pfn_button_string_get_rna_label     g_fn_button_string_get_rna_label = nullptr;
@@ -96,6 +110,9 @@ pfn_block_is_popup_any              g_fn_block_is_popup_any = nullptr;
 pfn_block_is_menu                   g_fn_block_is_menu = nullptr;
 pfn_CTX_wm_region_popup             g_fn_CTX_wm_region_popup = nullptr;
 pfn_CTX_wm_area                     g_fn_CTX_wm_area = nullptr;
+pfn_CTX_wm_window                   g_fn_CTX_wm_window = nullptr;
+pfn_button_to_pixelrect             g_fn_button_to_pixelrect = nullptr;
+pfn_button_string_get               g_fn_button_string_get = nullptr;
 
 constexpr int BLENDER_UI_SELECT       = (1 << 0);
 constexpr int BLENDER_UI_HOVER        = (1 << 2);
@@ -108,14 +125,30 @@ constexpr short RGN_TYPE_WINDOW       = 0;
 constexpr short RGN_TYPE_HEADER       = 1;
 constexpr short RGN_TYPE_TEMPORARY    = 3;
 constexpr short RGN_TYPE_UI           = 4;
+constexpr short RGN_TYPE_TOOLS        = 5;
 constexpr short RGN_TYPE_HUD          = 8;
 constexpr short RGN_TYPE_NAV_BAR      = 9;
+constexpr short RGN_TYPE_EXECUTE      = 10;
 constexpr short RGN_TYPE_TOOL_HEADER  = 12;
 
 constexpr char SPACE_VIEW3D           = 1;
+constexpr char SPACE_GRAPH            = 2;
 constexpr char SPACE_OUTLINER         = 3;
 constexpr char SPACE_PROPERTIES       = 4;
+constexpr char SPACE_FILE             = 5;
+constexpr char SPACE_IMAGE            = 6;
+constexpr char SPACE_INFO             = 7;
+constexpr char SPACE_SEQ              = 8;
+constexpr char SPACE_TEXT             = 9;
+constexpr char SPACE_ACTION           = 12;
+constexpr char SPACE_NLA              = 13;
+constexpr char SPACE_NODE             = 16;
+constexpr char SPACE_CONSOLE          = 18;
+constexpr char SPACE_USERPREF         = 19;
+constexpr char SPACE_CLIP             = 20;
 constexpr char SPACE_TOPBAR           = 21;
+constexpr char SPACE_STATUSBAR        = 22;
+constexpr char SPACE_SPREADSHEET      = 23;
 
 constexpr uint8_t BUT_TYPE_ROW        = 2;
 constexpr uint8_t BUT_TYPE_TEXT       = 3;
@@ -135,6 +168,11 @@ constexpr uint8_t BUT_TYPE_PULLDOWN   = 24;
 constexpr uint8_t BUT_TYPE_ROUNDBOX   = 25;
 constexpr uint8_t BUT_TYPE_SEARCHMENU = 34;
 constexpr uint8_t BUT_TYPE_SEPR       = 44;
+constexpr uint8_t BUT_TYPE_SEPR_LINE  = 45;
+constexpr uint8_t BUT_TYPE_SEPR_SPACER = 46;
+constexpr uint8_t BUT_TYPE_GRIP       = 47;
+constexpr uint8_t BUT_TYPE_DECORATOR  = 48;
+constexpr uint8_t BUT_TYPE_VIEW_ITEM  = 49;
 
 thread_local bool        t_inWidgetDraw = false;
 thread_local std::string t_currentWidgetText;
@@ -142,6 +180,7 @@ thread_local std::string t_pendingSearchPrefix;
 
 struct NavButtonEntry {
     uintptr_t   butPtr = 0;
+    uintptr_t   regionPtr = 0;
     int         winX = 0;
     int         winY = 0;
     uint8_t     butType = 0;
@@ -183,6 +222,10 @@ std::atomic<ULONGLONG>      g_lastDialogDrawTick{0};
 std::atomic<bool>           g_searchMenuOpen{false};
 std::atomic<ULONGLONG>      g_lastSearchDrawTick{0};
 std::atomic<bool>           g_isEditingText{false};
+std::atomic<ULONGLONG>      g_lastEditDrawTick{0};
+std::atomic<ULONGLONG>      g_lastModalSpaceDrawTick{0};
+std::atomic<bool>           g_modalSpaceWasActive{false};
+std::atomic<uint8_t>        g_lastModalSpaceType{0};
 std::atomic<bool>           g_transformActive{false};
 
 std::atomic<const void*>    g_lastActivatedButton{nullptr};
@@ -190,6 +233,29 @@ std::atomic<bool>           g_hooksInstalled{false};
 std::atomic<bool>           g_initialMouseCentered{false};
 HHOOK                       g_keyboardHook = nullptr;
 DWORD                       g_mainThreadId = 0;
+
+bool IsEditingTextNow() {
+    if (!g_isEditingText.load()) return false;
+    if (GetTickCount64() - g_lastEditDrawTick.load() > 900ULL) {
+        g_isEditingText.store(false);
+        return false;
+    }
+    return true;
+}
+
+bool IsModalSpaceOpen() {
+    ULONGLONG last = g_lastModalSpaceDrawTick.load();
+    if (last == 0) return false;
+    bool active = (GetTickCount64() - last) < 900ULL;
+    if (!active && g_modalSpaceWasActive.exchange(false)) {
+        std::lock_guard<std::mutex> lock(g_navMutex);
+        g_propTabs.clear();
+        g_propButtons.clear();
+        g_propTabIdx = 0;
+        g_propButtonIdx = 0;
+    }
+    return active;
+}
 
 bool GetActiveBlenderHwnd(HWND& outHwnd) {
     HWND hwnd = GetForegroundWindow();
@@ -263,6 +329,19 @@ void QueryNativeButtonInfo(
     }
 
     std::string drawStr = !rawDrawnText.empty() ? rawDrawnText : msvcDrawStr->ToStdString();
+    if (drawStr.empty() && g_fn_button_string_get != nullptr) {
+        const void* rnaPropCheck = *reinterpret_cast<const void* const*>(butBytes + 0x260);
+        if (butType == BUT_TYPE_NUM || butType == BUT_TYPE_NUMSLIDER ||
+            (rnaPropCheck != nullptr &&
+             (butType == BUT_TYPE_TEXT || butType == BUT_TYPE_TEXTBOX ||
+              butType == BUT_TYPE_SEARCHMENU || butType == BUT_TYPE_TAB))) {
+            char nativeBuf[256] = {};
+            g_fn_button_string_get(but, nativeBuf, sizeof(nativeBuf));
+            if (nativeBuf[0] != '\0') {
+                drawStr = nativeBuf;
+            }
+        }
+    }
     if (!drawStr.empty()) {
         size_t sepPos = drawStr.find('|');
         if (sepPos != std::string::npos) {
@@ -384,10 +463,15 @@ void QueryNativeButtonInfo(
 
 void UpsertButtonInList(std::vector<NavButtonEntry>& list, const NavButtonEntry& entry, bool sortVertical) {
     ULONGLONG now = entry.lastSeenTick;
-    // Remove stale buttons not drawn in the last 800 ms
+    // Remove stale buttons from the same region not drawn in the last 800 ms
     list.erase(
         std::remove_if(list.begin(), list.end(),
-            [now](const NavButtonEntry& b) { return (now > b.lastSeenTick) && ((now - b.lastSeenTick) > 800ULL); }),
+            [now, &entry](const NavButtonEntry& b) {
+                if (entry.regionPtr != 0 && b.regionPtr != 0 && b.regionPtr != entry.regionPtr) {
+                    return false;
+                }
+                return (now > b.lastSeenTick) && ((now - b.lastSeenTick) > 800ULL);
+            }),
         list.end());
 
     for (auto& b : list) {
@@ -455,7 +539,7 @@ bool ActivateCurrentZoneButton() {
             if (g_outlinerIdx < 0 || g_outlinerIdx >= static_cast<int>(g_outlinerButtons.size())) g_outlinerIdx = 0;
             target = g_outlinerButtons[g_outlinerIdx];
             found = true;
-        } else if (zone == 2 && !g_propButtons.empty()) {
+        } else if ((zone == 2 || IsModalSpaceOpen()) && !g_propButtons.empty()) {
             if (g_propButtonIdx < 0 || g_propButtonIdx >= static_cast<int>(g_propButtons.size())) g_propButtonIdx = 0;
             target = g_propButtons[g_propButtonIdx];
             found = true;
@@ -482,7 +566,7 @@ void CycleMainZone(int step) {
     if (nextZone == 0) {
         MoveCursorToWindowPos(g_view3dCenterX.load(), g_view3dCenterY.load());
         NvdaSpeechEngine::Instance().SpeakDirect(
-            "3D-сцена. Стрелки и PageUp PageDown: шаг, F: что впереди, C: координаты, E: захват детали, W A S D: поворот, Х и Ъ: размер шага, N: ввод координат От и До, Shift+A: добавить",
+            "3D-сцена. Стрелки и PageUp PageDown: шаг, Alt+Стрелки: поворот, F: что впереди, C: координаты, E: захват детали, L: метка детали, J: кадр и свет, V: скан формы, F10: снимок, Shift+P: разделы и вкладки, N: ввод От и До, Shift+A: добавить",
             true);
     } else if (nextZone == 1) {
         NavButtonEntry first{};
@@ -650,6 +734,86 @@ void Hook_draw_menu_item(
     }
 }
 
+std::string CleanPanelText(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool prevSpace = true;
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0) break;
+        if (c == '\r' || c == '\n' || c == '\t' || c == '|') {
+            if (!prevSpace) {
+                out.push_back(' ');
+                prevSpace = true;
+            }
+        } else if (c < 0x20) {
+            continue;
+        } else if (c == ' ') {
+            if (!prevSpace) {
+                out.push_back(' ');
+                prevSpace = true;
+            }
+        } else {
+            out.push_back(static_cast<char>(c));
+            prevSpace = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+void Hook_draw_aligned_panel(
+    const void* region,
+    const void* style,
+    const void* block,
+    const BlenderRcti* rect,
+    bool show_pin,
+    bool show_background,
+    bool region_search_filter_active)
+{
+    bool prevInDraw = t_inWidgetDraw;
+    std::string prevText = std::move(t_currentWidgetText);
+    t_inWidgetDraw = true;
+    t_currentWidgetText.clear();
+
+    if (g_orig_draw_aligned_panel) {
+        g_orig_draw_aligned_panel(region, style, block, rect, show_pin, show_background, region_search_filter_active);
+    }
+
+    std::string panelTitle = CleanPanelText(t_currentWidgetText);
+    t_inWidgetDraw = prevInDraw;
+    t_currentWidgetText = std::move(prevText);
+
+    if (!panelTitle.empty() && region != nullptr && rect != nullptr && block != nullptr) {
+        const auto* winrct = reinterpret_cast<const BlenderRcti*>(reinterpret_cast<const uint8_t*>(region) + 0xA8);
+        const short regionType = *reinterpret_cast<const short*>(reinterpret_cast<const uint8_t*>(region) + 0xC0);
+        if (regionType == RGN_TYPE_WINDOW || regionType == RGN_TYPE_UI || regionType == RGN_TYPE_TOOLS) {
+            int winX = winrct->xmin + (rect->xmin + rect->xmax) / 2;
+            int winY = winrct->ymin + rect->ymax + 12;
+
+            NavButtonEntry entry{};
+            entry.butPtr = reinterpret_cast<uintptr_t>(block) ^ 0x504E4C00ULL;
+            entry.regionPtr = reinterpret_cast<uintptr_t>(region);
+            entry.winX = winX;
+            entry.winY = winY;
+            entry.butType = BUT_TYPE_TAB;
+            entry.text = "Панель: " + panelTitle;
+            entry.lastSeenTick = GetTickCount64();
+
+            std::lock_guard<std::mutex> lock(g_navMutex);
+            UpsertButtonInList(g_propButtons, entry, true);
+        }
+    }
+}
+
+void Hook_file_draw_list(const void* C, void* region) {
+    g_lastModalSpaceDrawTick.store(GetTickCount64());
+    g_lastModalSpaceType.store(static_cast<uint8_t>(SPACE_FILE));
+    if (g_orig_file_draw_list) {
+        g_orig_file_draw_list(C, region);
+    }
+}
+
 void Hook_draw_button(const void* C, void* region, void* style, void* but, const BlenderRcti* rect) {
     if (!but) {
         if (g_orig_draw_button) g_orig_draw_button(C, region, style, but, rect);
@@ -665,6 +829,7 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
 
     if (butEditStr != nullptr) {
         g_isEditingText.store(true);
+        g_lastEditDrawTick.store(GetTickCount64());
     }
 
     bool isHoveredOrActive =
@@ -687,8 +852,9 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
     t_inWidgetDraw = prevInDraw;
     t_currentWidgetText = std::move(prevText);
 
-    // Ignore purely decorative separators/scrollbars/frames
-    if (butType == BUT_TYPE_SCROLL || butType == BUT_TYPE_ROUNDBOX || butType >= BUT_TYPE_SEPR) {
+    // Ignore purely decorative separators/scrollbars/frames, but preserve ViewItem (49)
+    if (butType == BUT_TYPE_SCROLL || butType == BUT_TYPE_ROUNDBOX ||
+        (butType >= BUT_TYPE_SEPR && butType <= BUT_TYPE_DECORATOR)) {
         return;
     }
 
@@ -703,8 +869,12 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
     if (region != nullptr && rect != nullptr) {
         const auto* winrct = reinterpret_cast<const BlenderRcti*>(reinterpret_cast<const uint8_t*>(region) + 0xA8);
         const short regionType = *reinterpret_cast<const short*>(reinterpret_cast<const uint8_t*>(region) + 0xC0);
-        int winX = winrct->xmin + (rect->xmin + rect->xmax) / 2;
-        int winY = winrct->ymin + (rect->ymin + rect->ymax) / 2;
+        BlenderRcti localRect = *rect;
+        if (g_fn_button_to_pixelrect != nullptr && butBlock != nullptr) {
+            g_fn_button_to_pixelrect(&localRect, region, butBlock, but);
+        }
+        int winX = winrct->xmin + (localRect.xmin + localRect.xmax) / 2;
+        int winY = winrct->ymin + (localRect.ymin + localRect.ymax) / 2;
 
         bool isPopup = (regionType == RGN_TYPE_TEMPORARY);
         if (!isPopup && C != nullptr && g_fn_CTX_wm_region_popup != nullptr) {
@@ -731,6 +901,7 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
                 g_lastDialogDrawTick.store(now);
                 NavButtonEntry entry{};
                 entry.butPtr = reinterpret_cast<uintptr_t>(but);
+                entry.regionPtr = reinterpret_cast<uintptr_t>(region);
                 entry.winX = winX;
                 entry.winY = winY;
                 entry.butType = butType;
@@ -754,6 +925,7 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
 
                 NavButtonEntry entry{};
                 entry.butPtr = reinterpret_cast<uintptr_t>(but);
+                entry.regionPtr = reinterpret_cast<uintptr_t>(region);
                 entry.winX = winX;
                 entry.winY = winY;
                 entry.butType = butType;
@@ -762,30 +934,65 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
                 entry.lastSeenTick = now;
 
                 std::lock_guard<std::mutex> lock(g_navMutex);
-                if (spacetype == SPACE_VIEW3D) {
-                    int cx = (areaRect->xmin + areaRect->xmax) / 2;
-                    int cy = (areaRect->ymin + areaRect->ymax) / 2;
-                    if (cx > 0 && cy > 0) {
-                        g_view3dCenterX.store(cx);
-                        g_view3dCenterY.store(cy);
-                        if (!g_initialMouseCentered.exchange(true)) {
-                            MoveCursorToWindowPos(cx, cy);
-                        }
+                bool modalActiveNow = (g_lastModalSpaceDrawTick.load() != 0) && ((now - g_lastModalSpaceDrawTick.load()) < 900ULL);
+                if (spacetype == SPACE_USERPREF || spacetype == SPACE_FILE) {
+                    g_lastModalSpaceDrawTick.store(now);
+                    g_lastModalSpaceType.store(static_cast<uint8_t>(spacetype));
+                    if (!g_modalSpaceWasActive.exchange(true)) {
+                        g_propTabs.clear();
+                        g_propButtons.clear();
+                        g_propTabIdx = 0;
+                        g_propButtonIdx = 0;
                     }
-                    if (regionType == RGN_TYPE_HEADER || regionType == RGN_TYPE_TOOL_HEADER || regionType == RGN_TYPE_UI) {
-                        UpsertButtonInList(g_topMenuButtons, entry, false);
-                    }
-                } else if (spacetype == SPACE_TOPBAR) {
-                    UpsertButtonInList(g_topMenuButtons, entry, false);
-                } else if (spacetype == SPACE_OUTLINER) {
-                    if (regionType == RGN_TYPE_WINDOW) {
-                        UpsertButtonInList(g_outlinerButtons, entry, true);
-                    }
-                } else if (spacetype == SPACE_PROPERTIES) {
-                    if (butType == BUT_TYPE_TAB || regionType == RGN_TYPE_NAV_BAR) {
+                    bool isNavTab =
+                        (butType == BUT_TYPE_TAB) ||
+                        (regionType == RGN_TYPE_NAV_BAR) ||
+                        (butType == BUT_TYPE_ROW && regionType == RGN_TYPE_UI);
+                    if (isNavTab) {
                         UpsertButtonInList(g_propTabs, entry, true);
-                    } else if (regionType == RGN_TYPE_WINDOW) {
+                    } else if (regionType == RGN_TYPE_WINDOW || regionType == RGN_TYPE_EXECUTE ||
+                               regionType == RGN_TYPE_HEADER || regionType == RGN_TYPE_TOOL_HEADER ||
+                               regionType == RGN_TYPE_TOOLS || regionType == RGN_TYPE_UI) {
                         UpsertButtonInList(g_propButtons, entry, true);
+                    }
+                } else if (!modalActiveNow) {
+                    if (spacetype == SPACE_VIEW3D) {
+                        int cx = (areaRect->xmin + areaRect->xmax) / 2;
+                        int cy = (areaRect->ymin + areaRect->ymax) / 2;
+                        if (cx > 0 && cy > 0) {
+                            g_view3dCenterX.store(cx);
+                            g_view3dCenterY.store(cy);
+                            if (!g_initialMouseCentered.exchange(true)) {
+                                if (!g_dialogPopupOpen.load() && !g_nativeMenuOpen.load() && !g_searchMenuOpen.load()) {
+                                    MoveCursorToWindowPos(cx, cy);
+                                }
+                            }
+                        }
+                        if (regionType == RGN_TYPE_HEADER || regionType == RGN_TYPE_TOOL_HEADER || regionType == RGN_TYPE_UI) {
+                            UpsertButtonInList(g_topMenuButtons, entry, false);
+                        }
+                    } else if (spacetype == SPACE_TOPBAR) {
+                        UpsertButtonInList(g_topMenuButtons, entry, false);
+                    } else if (spacetype == SPACE_OUTLINER) {
+                        if (regionType == RGN_TYPE_WINDOW) {
+                            UpsertButtonInList(g_outlinerButtons, entry, true);
+                        }
+                    } else if (spacetype == SPACE_PROPERTIES) {
+                        if (butType == BUT_TYPE_TAB || regionType == RGN_TYPE_NAV_BAR) {
+                            UpsertButtonInList(g_propTabs, entry, true);
+                        } else if (regionType == RGN_TYPE_WINDOW) {
+                            UpsertButtonInList(g_propButtons, entry, true);
+                        }
+                    } else if (spacetype == SPACE_NODE || spacetype == SPACE_GRAPH || spacetype == SPACE_IMAGE ||
+                               spacetype == SPACE_SEQ || spacetype == SPACE_TEXT || spacetype == SPACE_ACTION ||
+                               spacetype == SPACE_NLA || spacetype == SPACE_CONSOLE || spacetype == SPACE_INFO ||
+                               spacetype == SPACE_CLIP || spacetype == SPACE_SPREADSHEET) {
+                        if (regionType == RGN_TYPE_HEADER || regionType == RGN_TYPE_TOOL_HEADER) {
+                            UpsertButtonInList(g_topMenuButtons, entry, false);
+                        } else if (regionType == RGN_TYPE_WINDOW || regionType == RGN_TYPE_UI ||
+                                   regionType == RGN_TYPE_TOOLS || regionType == RGN_TYPE_HUD) {
+                            UpsertButtonInList(g_propButtons, entry, true);
+                        }
                     }
                 }
             }
@@ -848,6 +1055,7 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
 
             if (wParam == VK_ESCAPE) {
                 bool wasPopupOpen = (inSearchMenu || inNativeMenu || inDialogPopup);
+                bool inModalSpaceEsc = IsModalSpaceOpen();
                 int prevZone = g_currentZone.exchange(0);
                 {
                     std::lock_guard<std::mutex> lock(g_navMutex);
@@ -858,12 +1066,15 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 g_dialogPopupOpen.store(false);
                 g_searchMenuOpen.store(false);
                 g_isEditingText.store(false);
+                g_lastEditDrawTick.store(0);
                 g_transformActive.store(false);
                 NvdaSpeechEngine::Instance().CancelSpeechAndResetFocus();
-                MoveCursorToWindowPos(g_view3dCenterX.load(), g_view3dCenterY.load());
+                if (!inModalSpaceEsc) {
+                    MoveCursorToWindowPos(g_view3dCenterX.load(), g_view3dCenterY.load());
+                }
                 if (wasPopupOpen) {
                     NvdaSpeechEngine::Instance().SpeakDirect("Окно закрыто. 3D-сцена", true);
-                } else if (prevZone != 0) {
+                } else if (prevZone != 0 && !inModalSpaceEsc) {
                     NvdaSpeechEngine::Instance().SpeakDirect("Возврат в 3D-сцену", true);
                 }
                 return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
@@ -888,7 +1099,7 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             if (inDialogPopup) {
                 if (wParam == VK_RETURN) {
                     NvdaSpeechEngine::Instance().CancelSpeechAndResetFocus();
-                    if (g_isEditingText.load()) {
+                    if (IsEditingTextNow()) {
                         // Commit typed value inside the active number/text box
                         g_isEditingText.store(false);
                         return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
@@ -897,7 +1108,7 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                         return 1;
                     }
                 }
-                if (!g_isEditingText.load() && !ctrlDown) {
+                if (!IsEditingTextNow() && !ctrlDown) {
                     if (wParam == VK_DOWN || wParam == VK_UP || wParam == VK_TAB) {
                         int dir = (wParam == VK_UP || (wParam == VK_TAB && shiftDown)) ? -1 : 1;
                         if (StepButtonVector(g_popupButtons, g_popupIdx, dir, false)) {
@@ -908,12 +1119,13 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
             }
 
-            // 3. When no menu/popup is open, route by active Zone (0..3):
+            // 3. When no menu/popup is open, route by active Zone (0..3), or active modal Space (Preferences / File Browser):
             int zone = g_currentZone.load();
+            bool inModalSpace = IsModalSpaceOpen();
 
-            if (zone == 0) {
+            if (zone == 0 && !inModalSpace) {
                 // Zone 0: 3D-сцена — pass all keys directly to Blender's native 3D View keymap!
-                if (!g_isEditingText.load() && !ctrlDown && !altDown) {
+                if (!IsEditingTextNow() && !ctrlDown && !altDown) {
                     if (wParam == 'G' || wParam == 'R' || wParam == 'S') {
                         g_transformActive.store(true);
                     }
@@ -921,10 +1133,22 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
             }
 
-            // Zones 1, 2, 3 (Outliner, Properties, Top Menu):
+            // In File Browser (Ctrl+S / Ctrl+O): let arrow keys, PageUp/Down, Home/End, Enter, and Backspace
+            // pass directly to Blender's native file list instead of snapping cursor to header buttons;
+            // Tab / Shift+Tab still walks between File Browser controls.
+            if (inModalSpace && g_lastModalSpaceType.load() == static_cast<uint8_t>(SPACE_FILE)) {
+                if (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_LEFT || wParam == VK_RIGHT ||
+                    wParam == VK_PRIOR || wParam == VK_NEXT || wParam == VK_HOME || wParam == VK_END ||
+                    wParam == VK_RETURN || wParam == VK_BACK) {
+                    NvdaSpeechEngine::Instance().CancelSpeechAndResetFocus();
+                    return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+                }
+            }
+
+            // Zones 1, 2, 3 (Outliner, Properties, Top Menu) or Modal Space (Preferences, File Browser):
             if (wParam == VK_RETURN) {
                 NvdaSpeechEngine::Instance().CancelSpeechAndResetFocus();
-                if (g_isEditingText.load()) {
+                if (IsEditingTextNow()) {
                     g_isEditingText.store(false);
                     return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
                 }
@@ -934,43 +1158,48 @@ LRESULT CALLBACK BlenderKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
             }
 
-            if (!g_isEditingText.load() && !ctrlDown && !altDown) {
-                if (zone == 2) {
-                    // Zone 2: Настройки и свойства
-                    // Left / Right switches Properties Tabs (Рендер, Объект, Модификаторы, Материалы...)
+            if (!IsEditingTextNow() && !ctrlDown && !altDown) {
+                if (inModalSpace || zone == 2) {
+                    // Zone 2 / Modal Space (Preferences, File Browser, Shading/Material panels):
+                    // Left / Right switches Tabs if >= 2 tabs exist; otherwise steps controls without leaking to 3D View!
                     if (wParam == VK_LEFT || wParam == VK_RIGHT) {
                         int dir = (wParam == VK_RIGHT) ? 1 : -1;
+                        bool hasTabs = false;
                         {
                             std::lock_guard<std::mutex> lock(g_navMutex);
-                            g_propButtons.clear();
-                            g_propButtonIdx = 0;
+                            hasTabs = (g_propTabs.size() >= 2);
+                            if (hasTabs) {
+                                g_propButtons.clear();
+                                g_propButtonIdx = 0;
+                            }
                         }
-                        if (StepButtonVector(g_propTabs, g_propTabIdx, dir, true)) {
-                            return 1;
+                        if (hasTabs) {
+                            StepButtonVector(g_propTabs, g_propTabIdx, dir, true);
+                        } else if (!StepButtonVector(g_propButtons, g_propButtonIdx, dir, false)) {
+                            NvdaSpeechEngine::Instance().SpeakDirect("В этом разделе одна вкладка", true);
                         }
+                        return 1;
                     }
-                    // Up / Down walks through the settings of the current tab
-                    if (wParam == VK_DOWN || wParam == VK_UP) {
-                        int dir = (wParam == VK_DOWN) ? 1 : -1;
-                        if (StepButtonVector(g_propButtons, g_propButtonIdx, dir, false)) {
-                            return 1;
+                    if (wParam == VK_DOWN || wParam == VK_UP || wParam == VK_TAB) {
+                        int dir = (wParam == VK_UP || (wParam == VK_TAB && shiftDown)) ? -1 : 1;
+                        if (!StepButtonVector(g_propButtons, g_propButtonIdx, dir, false)) {
+                            NvdaSpeechEngine::Instance().SpeakDirect("Нет доступных элементов, нажмите F6 для смены зоны", true);
                         }
+                        return 1;
                     }
                 } else if (zone == 3) {
                     // Zone 3: Верхнее меню
                     if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_DOWN || wParam == VK_UP) {
                         int dir = (wParam == VK_RIGHT || wParam == VK_DOWN) ? 1 : -1;
-                        if (StepButtonVector(g_topMenuButtons, g_topMenuIdx, dir, false)) {
-                            return 1;
-                        }
+                        StepButtonVector(g_topMenuButtons, g_topMenuIdx, dir, false);
+                        return 1;
                     }
                 } else if (zone == 1) {
                     // Zone 1: Список объектов сцены (Outliner)
                     if (wParam == VK_DOWN || wParam == VK_UP) {
                         int dir = (wParam == VK_DOWN) ? 1 : -1;
-                        if (StepButtonVector(g_outlinerButtons, g_outlinerIdx, dir, false)) {
-                            return 1;
-                        }
+                        StepButtonVector(g_outlinerButtons, g_outlinerIdx, dir, false);
+                        return 1;
                     }
                 }
             }
@@ -987,6 +1216,8 @@ std::wstring GetModuleFolder(HMODULE hMod) {
     size_t pos = full.find_last_of(L"\\/");
     return (pos != std::wstring::npos) ? full.substr(0, pos) : L"";
 }
+
+std::atomic<int> g_hookFlags{0};
 
 } // namespace
 
@@ -1011,8 +1242,9 @@ extern "C" __declspec(dllexport) int InitBlenderAccessibility() {
     }
 
     std::wstring pdbPath = exeDir + L"\\blender.pdb";
+    std::wstring cachePath = (!dllDir.empty() ? dllDir : exeDir) + L"\\blender_nvda_symbols.cache";
     ResolvedBlenderSymbols syms{};
-    if (!BlenderSymbolResolver::ResolveFromPdb(hExe, pdbPath, syms)) {
+    if (!BlenderSymbolResolver::ResolveFromPdb(hExe, pdbPath, syms, cachePath)) {
         return -1;
     }
 
@@ -1029,6 +1261,9 @@ extern "C" __declspec(dllexport) int InitBlenderAccessibility() {
     g_fn_block_is_menu                   = reinterpret_cast<pfn_block_is_menu>(syms.fn_block_is_menu);
     g_fn_CTX_wm_region_popup             = reinterpret_cast<pfn_CTX_wm_region_popup>(syms.fn_CTX_wm_region_popup);
     g_fn_CTX_wm_area                     = reinterpret_cast<pfn_CTX_wm_area>(syms.fn_CTX_wm_area);
+    g_fn_CTX_wm_window                   = reinterpret_cast<pfn_CTX_wm_window>(syms.fn_CTX_wm_window);
+    g_fn_button_to_pixelrect             = reinterpret_cast<pfn_button_to_pixelrect>(syms.fn_button_to_pixelrect);
+    g_fn_button_string_get               = reinterpret_cast<pfn_button_string_get>(syms.fn_button_string_get);
 
     uint8_t* arena = FunctionInterceptor::AllocateNearAddress(reinterpret_cast<uintptr_t>(hExe));
     if (!arena) {
@@ -1072,6 +1307,34 @@ extern "C" __declspec(dllexport) int InitBlenderAccessibility() {
             reinterpret_cast<void**>(&g_orig_button_activate_over));
     }
 
+    int flags = 0;
+    if (syms.fn_CTX_wm_window) {
+        flags |= 1;
+    }
+    if (syms.fn_draw_aligned_panel) {
+        flags |= 2;
+        if (FunctionInterceptor::InstallDetour(
+                syms.fn_draw_aligned_panel,
+                reinterpret_cast<uintptr_t>(&Hook_draw_aligned_panel),
+                cursor,
+                reinterpret_cast<void**>(&g_orig_draw_aligned_panel)))
+        {
+            flags |= 4;
+        }
+    }
+    if (syms.fn_file_draw_list) {
+        flags |= 8;
+        if (FunctionInterceptor::InstallDetour(
+                syms.fn_file_draw_list,
+                reinterpret_cast<uintptr_t>(&Hook_file_draw_list),
+                cursor,
+                reinterpret_cast<void**>(&g_orig_file_draw_list)))
+        {
+            flags |= 16;
+        }
+    }
+    g_hookFlags.store(flags);
+
     g_mainThreadId = GetCurrentThreadId();
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD, BlenderKeyboardProc, nullptr, g_mainThreadId);
 
@@ -1085,6 +1348,19 @@ extern "C" __declspec(dllexport) void SpeakBlenderText(const char* utf8Text, int
 
 extern "C" __declspec(dllexport) int GetActiveBlenderZone() {
     return g_currentZone.load();
+}
+
+extern "C" __declspec(dllexport) void SetActiveBlenderZone(int zone) {
+    if (zone >= 0 && zone <= 3) {
+        g_currentZone.store(zone);
+        g_nativeMenuOpen.store(false);
+        g_dialogPopupOpen.store(false);
+        g_searchMenuOpen.store(false);
+    }
+}
+
+extern "C" __declspec(dllexport) int GetAccessibilityHookFlags() {
+    return g_hookFlags.load();
 }
 
 extern "C" __declspec(dllexport) int IsBlenderPopupOpen() {
