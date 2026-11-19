@@ -29,6 +29,16 @@ struct ResolvedBlenderSymbols {
     uintptr_t fn_file_draw_list = 0;
     uintptr_t fn_button_to_pixelrect = 0;
     uintptr_t fn_button_string_get = 0;
+    uintptr_t fn_s_wndProc = 0;
+    uintptr_t fn_button_execute = 0;
+    uintptr_t fn_button_activate_event = 0;
+    uintptr_t fn_textbutton_activate_but = 0;
+    uintptr_t fn_CTX_wm_area_set = 0;
+    uintptr_t fn_CTX_wm_region_set = 0;
+    uintptr_t fn_CTX_wm_region = 0;
+    uintptr_t fn_CTX_wm_screen = 0;
+    uintptr_t fn_ED_region_tag_redraw = 0;
+    uintptr_t fn_CTX_wm_window_set = 0;
 };
 
 class BlenderSymbolResolver {
@@ -72,6 +82,104 @@ public:
             sectionRvas[i + 1] = secHdr[i].VirtualAddress;
         }
 
+        if (!ScanPdbForRvas(pdbPath, sectionRvas, baseAddr, outSyms)) {
+            return false;
+        }
+        if (!cachePath.empty()) {
+            SaveCache(cachePath, exeSize, exeWriteTime, baseAddr, outSyms);
+        }
+        return true;
+    }
+
+    static bool PrebuildCacheFromFiles(
+        const std::wstring& exePath,
+        const std::wstring& pdbPath,
+        const std::wstring& cachePath)
+    {
+        if (exePath.empty() || pdbPath.empty() || cachePath.empty()) return false;
+
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!GetFileAttributesExW(exePath.c_str(), GetFileExInfoStandard, &fad)) {
+            return false;
+        }
+        uint64_t exeSize = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        uint64_t exeWriteTime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                               fad.ftLastWriteTime.dwLowDateTime;
+
+        HANDLE hExe = CreateFileW(
+            exePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (hExe == INVALID_HANDLE_VALUE) return false;
+
+        IMAGE_DOS_HEADER dosHdr{};
+        DWORD bytesRead = 0;
+        if (!ReadFile(hExe, &dosHdr, sizeof(dosHdr), &bytesRead, nullptr) ||
+            bytesRead != sizeof(dosHdr) ||
+            dosHdr.e_magic != IMAGE_DOS_SIGNATURE ||
+            dosHdr.e_lfanew <= 0) {
+            CloseHandle(hExe);
+            return false;
+        }
+
+        LARGE_INTEGER off{};
+        off.QuadPart = dosHdr.e_lfanew;
+        if (!SetFilePointerEx(hExe, off, nullptr, FILE_BEGIN)) {
+            CloseHandle(hExe);
+            return false;
+        }
+
+        IMAGE_NT_HEADERS64 ntHdr{};
+        if (!ReadFile(hExe, &ntHdr, sizeof(ntHdr), &bytesRead, nullptr) ||
+            bytesRead != sizeof(ntHdr) ||
+            ntHdr.Signature != IMAGE_NT_SIGNATURE ||
+            ntHdr.FileHeader.NumberOfSections == 0) {
+            CloseHandle(hExe);
+            return false;
+        }
+
+        WORD numSections = ntHdr.FileHeader.NumberOfSections;
+        off.QuadPart = static_cast<LONGLONG>(dosHdr.e_lfanew) +
+                       static_cast<LONGLONG>(sizeof(DWORD)) +
+                       static_cast<LONGLONG>(sizeof(IMAGE_FILE_HEADER)) +
+                       static_cast<LONGLONG>(ntHdr.FileHeader.SizeOfOptionalHeader);
+        if (!SetFilePointerEx(hExe, off, nullptr, FILE_BEGIN)) {
+            CloseHandle(hExe);
+            return false;
+        }
+
+        std::vector<IMAGE_SECTION_HEADER> secs(numSections);
+        DWORD secBytes = static_cast<DWORD>(numSections * sizeof(IMAGE_SECTION_HEADER));
+        if (!ReadFile(hExe, secs.data(), secBytes, &bytesRead, nullptr) || bytesRead != secBytes) {
+            CloseHandle(hExe);
+            return false;
+        }
+        CloseHandle(hExe);
+
+        std::vector<uint32_t> sectionRvas(numSections + 1, 0);
+        for (WORD i = 0; i < numSections; ++i) {
+            sectionRvas[i + 1] = secs[i].VirtualAddress;
+        }
+
+        constexpr uintptr_t kSyntheticBase = 0x100000000ULL;
+        ResolvedBlenderSymbols syms{};
+        if (!ScanPdbForRvas(pdbPath, sectionRvas, kSyntheticBase, syms)) {
+            return false;
+        }
+        return SaveCache(cachePath, exeSize, exeWriteTime, kSyntheticBase, syms);
+    }
+
+private:
+    static bool ScanPdbForRvas(
+        const std::wstring& pdbPath,
+        const std::vector<uint32_t>& sectionRvas,
+        uintptr_t baseAddr,
+        ResolvedBlenderSymbols& outSyms)
+    {
         // Open blender.pdb via memory-mapped view for fast single-pass scanning
         HANDLE hFile = CreateFileW(pdbPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) return false;
@@ -128,6 +236,16 @@ public:
             {"?file_draw_list@blender@@", 0, &ResolvedBlenderSymbols::fn_file_draw_list, false},
             {"?button_to_pixelrect@ui@blender@@", 0, &ResolvedBlenderSymbols::fn_button_to_pixelrect, false},
             {"?button_string_get@ui@blender@@YAXPEAUButton", 0, &ResolvedBlenderSymbols::fn_button_string_get, false},
+            {"?s_wndProc@GHOST_SystemWin32@@", 0, &ResolvedBlenderSymbols::fn_s_wndProc, false},
+            {"?button_execute@ui@blender@@", 0, &ResolvedBlenderSymbols::fn_button_execute, false},
+            {"?button_activate_event@ui@blender@@", 0, &ResolvedBlenderSymbols::fn_button_activate_event, false},
+            {"?textbutton_activate_but@ui@blender@@", 0, &ResolvedBlenderSymbols::fn_textbutton_activate_but, false},
+            {"?CTX_wm_area_set@blender@@", 0, &ResolvedBlenderSymbols::fn_CTX_wm_area_set, false},
+            {"?CTX_wm_region_set@blender@@", 0, &ResolvedBlenderSymbols::fn_CTX_wm_region_set, false},
+            {"?CTX_wm_region@blender@@", 0, &ResolvedBlenderSymbols::fn_CTX_wm_region, false},
+            {"?CTX_wm_screen@blender@@", 0, &ResolvedBlenderSymbols::fn_CTX_wm_screen, false},
+            {"?ED_region_tag_redraw@blender@@", 0, &ResolvedBlenderSymbols::fn_ED_region_tag_redraw, false},
+            {"?CTX_wm_window_set@blender@@", 0, &ResolvedBlenderSymbols::fn_CTX_wm_window_set, false},
         };
 
         constexpr size_t kNumTargets = sizeof(targets) / sizeof(targets[0]);
@@ -163,14 +281,8 @@ public:
         CloseHandle(hMap);
         CloseHandle(hFile);
 
-        bool ok = (outSyms.fn_BLF_draw != 0 && outSyms.fn_draw_button != 0);
-        if (ok && !cachePath.empty()) {
-            SaveCache(cachePath, exeSize, exeWriteTime, baseAddr, outSyms);
-        }
-        return ok;
+        return (outSyms.fn_BLF_draw != 0 && outSyms.fn_draw_button != 0);
     }
-
-private:
 #pragma pack(push, 1)
     struct PubSym32Prefix {
         uint16_t rectype;
@@ -184,29 +296,31 @@ private:
         uint32_t version;
         uint64_t exeSize;
         uint64_t exeWriteTime;
-        uint64_t rvas[23];
+        uint64_t rvas[33];
     };
 #pragma pack(pop)
 
     static constexpr uint32_t kCacheMagic = 0x424E5632; // 'BNV2'
-    static constexpr uint32_t kCacheVersion = 1;
+    static constexpr uint32_t kCacheVersion = 3;
 
-    static void PackRvas(uintptr_t baseAddr, const ResolvedBlenderSymbols& s, uint64_t (&out)[23]) {
-        const uintptr_t ptrs[23] = {
+    static void PackRvas(uintptr_t baseAddr, const ResolvedBlenderSymbols& s, uint64_t (&out)[33]) {
+        const uintptr_t ptrs[33] = {
             s.fn_BLF_draw, s.fn_BLF_draw_mono, s.fn_draw_button, s.fn_draw_menu_item, s.fn_button_activate_over,
             s.fn_button_string_get_label, s.fn_button_string_get_rna_label, s.fn_button_string_get_tooltip_label,
             s.fn_button_string_get_tooltip, s.fn_button_rna_enum_item_get, s.fn_RNA_property_ui_name,
             s.fn_RNA_property_ui_description, s.fn_RNA_property_array_check, s.fn_RNA_property_array_item_char,
             s.fn_block_is_popup_any, s.fn_block_is_menu, s.fn_CTX_wm_region_popup, s.fn_CTX_wm_area,
             s.fn_CTX_wm_window, s.fn_draw_aligned_panel, s.fn_file_draw_list, s.fn_button_to_pixelrect,
-            s.fn_button_string_get
+            s.fn_button_string_get, s.fn_s_wndProc, s.fn_button_execute, s.fn_button_activate_event,
+            s.fn_textbutton_activate_but, s.fn_CTX_wm_area_set, s.fn_CTX_wm_region_set,
+            s.fn_CTX_wm_region, s.fn_CTX_wm_screen, s.fn_ED_region_tag_redraw, s.fn_CTX_wm_window_set
         };
-        for (int i = 0; i < 23; ++i) {
+        for (int i = 0; i < 33; ++i) {
             out[i] = (ptrs[i] >= baseAddr && ptrs[i] != 0) ? static_cast<uint64_t>(ptrs[i] - baseAddr) : 0ULL;
         }
     }
 
-    static void UnpackRvas(uintptr_t baseAddr, const uint64_t (&in)[23], ResolvedBlenderSymbols& s) {
+    static void UnpackRvas(uintptr_t baseAddr, const uint64_t (&in)[33], ResolvedBlenderSymbols& s) {
         auto toAddr = [baseAddr](uint64_t rva) -> uintptr_t { return rva ? (baseAddr + static_cast<uintptr_t>(rva)) : 0; };
         s.fn_BLF_draw = toAddr(in[0]);
         s.fn_BLF_draw_mono = toAddr(in[1]);
@@ -231,6 +345,16 @@ private:
         s.fn_file_draw_list = toAddr(in[20]);
         s.fn_button_to_pixelrect = toAddr(in[21]);
         s.fn_button_string_get = toAddr(in[22]);
+        s.fn_s_wndProc = toAddr(in[23]);
+        s.fn_button_execute = toAddr(in[24]);
+        s.fn_button_activate_event = toAddr(in[25]);
+        s.fn_textbutton_activate_but = toAddr(in[26]);
+        s.fn_CTX_wm_area_set = toAddr(in[27]);
+        s.fn_CTX_wm_region_set = toAddr(in[28]);
+        s.fn_CTX_wm_region = toAddr(in[29]);
+        s.fn_CTX_wm_screen = toAddr(in[30]);
+        s.fn_ED_region_tag_redraw = toAddr(in[31]);
+        s.fn_CTX_wm_window_set = toAddr(in[32]);
     }
 
     static bool LoadCache(const std::wstring& cachePath, uint64_t exeSize, uint64_t exeWriteTime, uintptr_t baseAddr, ResolvedBlenderSymbols& outSyms) {
@@ -248,7 +372,7 @@ private:
         return true;
     }
 
-    static void SaveCache(const std::wstring& cachePath, uint64_t exeSize, uint64_t exeWriteTime, uintptr_t baseAddr, const ResolvedBlenderSymbols& syms) {
+    static bool SaveCache(const std::wstring& cachePath, uint64_t exeSize, uint64_t exeWriteTime, uintptr_t baseAddr, const ResolvedBlenderSymbols& syms) {
         CachedSymbolRvas data{};
         data.magic = kCacheMagic;
         data.version = kCacheVersion;
@@ -258,8 +382,10 @@ private:
         HANDLE hFile = CreateFileW(cachePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD written = 0;
-            WriteFile(hFile, &data, sizeof(data), &written, nullptr);
+            BOOL ok = WriteFile(hFile, &data, sizeof(data), &written, nullptr);
             CloseHandle(hFile);
+            return ok && written == sizeof(data);
         }
+        return false;
     }
 };

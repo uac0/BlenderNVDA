@@ -3,6 +3,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,8 +15,8 @@ typedef unsigned long (__stdcall *pfn_nvdaController_testIfRunning)(void);
 class NvdaSpeechEngine {
 public:
     static NvdaSpeechEngine& Instance() {
-        static NvdaSpeechEngine inst;
-        return inst;
+        static NvdaSpeechEngine* inst = new NvdaSpeechEngine();
+        return *inst;
     }
 
     bool Initialize(const std::wstring& dllDir) {
@@ -37,16 +38,33 @@ public:
             GetProcAddress(m_hNvda, "nvdaController_testIfRunning"));
 
         m_startupTime = GetTickCount64();
-        return (m_speakText != nullptr && m_cancelSpeech != nullptr);
+        bool ok = (m_speakText != nullptr && m_cancelSpeech != nullptr);
+        if (ok && !m_workerStarted) {
+            if (!m_wakeEvent) {
+                m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            }
+            if (m_wakeEvent) {
+                HANDLE hThread = CreateThread(nullptr, 0, &NvdaSpeechEngine::WorkerThreadProc, this, 0, nullptr);
+                if (hThread) {
+                    CloseHandle(hThread);
+                    m_workerStarted = true;
+                }
+            }
+        }
+        return ok;
     }
 
     void CancelSpeechAndResetFocus() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_cancelSpeech) {
-            m_cancelSpeech();
+        bool hasCancel = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            hasCancel = (m_cancelSpeech != nullptr);
+            m_lastFocusedText.clear();
+            m_lastFocusedWidgetId = 0;
         }
-        m_lastFocusedText.clear();
-        m_lastFocusedWidgetId = 0;
+        if (hasCancel) {
+            EnqueueCancel();
+        }
     }
 
     void ClearTooltipBuffer() {
@@ -75,42 +93,43 @@ public:
     }
 
     void SpeakCurrentTooltip() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_speakText) return;
-        if (m_cancelSpeech) {
-            m_cancelSpeech();
-        }
-        std::string toSpeak;
-        if (!m_lastFocusedText.empty() && !m_tooltipLines.empty()) {
-            if (m_tooltipLines.find(m_lastFocusedText) == 0) {
+        std::wstring wide;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_speakText) return;
+            std::string toSpeak;
+            if (!m_lastFocusedText.empty() && !m_tooltipLines.empty()) {
+                if (m_tooltipLines.find(m_lastFocusedText) == 0) {
+                    toSpeak = m_tooltipLines;
+                } else {
+                    toSpeak = m_lastFocusedText + ". " + m_tooltipLines;
+                }
+            } else if (!m_tooltipLines.empty()) {
                 toSpeak = m_tooltipLines;
             } else {
-                toSpeak = m_lastFocusedText + ". " + m_tooltipLines;
+                toSpeak = m_lastFocusedText;
             }
-        } else if (!m_tooltipLines.empty()) {
-            toSpeak = m_tooltipLines;
-        } else {
-            toSpeak = m_lastFocusedText;
+            if (toSpeak.empty()) return;
+            wide = Utf8ToWide(toSpeak);
         }
-        if (toSpeak.empty()) return;
-        std::wstring wide = Utf8ToWide(toSpeak);
         if (!wide.empty()) {
-            m_speakText(wide.c_str());
+            EnqueueSpeech(wide, true);
         }
     }
 
     void SpeakDirect(const std::string& utf8Text, bool interrupt = true) {
         std::string cleaned = CleanText(utf8Text);
         if (cleaned.empty()) return;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_speakText) return;
-        if (interrupt && m_cancelSpeech) {
-            m_cancelSpeech();
+        std::wstring wide;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_speakText) return;
+            ULONGLONG now = GetTickCount64();
+            m_spokenCache[cleaned] = now;
+            wide = Utf8ToWide(cleaned);
         }
-        m_spokenCache[cleaned] = GetTickCount64();
-        std::wstring wide = Utf8ToWide(cleaned);
         if (!wide.empty()) {
-            m_speakText(wide.c_str());
+            EnqueueSpeech(wide, interrupt);
         }
     }
 
@@ -120,31 +139,31 @@ public:
         std::string cleaned = CleanText(utf8Text);
         if (cleaned.empty()) return;
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_speakText) return;
+        std::wstring wide;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_speakText) return;
 
-        ULONGLONG now = GetTickCount64();
-        if (!forceInterrupt && widgetId == m_lastFocusedWidgetId && cleaned == m_lastFocusedText) {
-            if (now - m_lastFocusedTime < 120000ULL) {
-                return;
+            ULONGLONG now = GetTickCount64();
+            PruneExpiredLocked(now);
+            if (!forceInterrupt) {
+                if (cleaned == m_lastFocusedText && (now - m_lastFocusedTime < 120000ULL)) {
+                    return;
+                }
             }
-        }
 
-        if (widgetId != m_lastFocusedWidgetId) {
-            m_tooltipLines.clear();
-        }
+            if (widgetId != m_lastFocusedWidgetId) {
+                m_tooltipLines.clear();
+            }
 
-        m_lastFocusedWidgetId = widgetId;
-        m_lastFocusedText = cleaned;
-        m_lastFocusedTime = now;
-        m_spokenCache[cleaned] = now;
-
-        if (m_cancelSpeech) {
-            m_cancelSpeech();
+            m_lastFocusedWidgetId = widgetId;
+            m_lastFocusedText = cleaned;
+            m_lastFocusedTime = now;
+            m_spokenCache[cleaned] = now;
+            wide = Utf8ToWide(cleaned);
         }
-        std::wstring wide = Utf8ToWide(cleaned);
         if (!wide.empty()) {
-            m_speakText(wide.c_str());
+            EnqueueSpeech(wide, true);
         }
     }
 
@@ -162,36 +181,102 @@ public:
         std::string cleaned = CleanText(utf8Text);
         if (cleaned.empty() || IsIgnorableFragment(cleaned)) return;
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_speakText) return;
+        std::wstring wide;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_speakText) return;
 
-        ULONGLONG now = GetTickCount64();
-        PruneExpiredLocked(now);
+            ULONGLONG now = GetTickCount64();
+            PruneExpiredLocked(now);
 
-        if (now - m_startupTime < 1500ULL) {
-            m_spokenCache[cleaned] = now;
-            return;
-        }
-
-        auto it = m_spokenCache.find(cleaned);
-        if (it != m_spokenCache.end()) {
-            if (now - it->second < 120000ULL) {
+            if (now - m_startupTime < 1500ULL) {
+                m_spokenCache[cleaned] = now;
                 return;
             }
-        }
 
-        m_spokenCache[cleaned] = now;
-        if (interrupt && m_cancelSpeech) {
-            m_cancelSpeech();
+            auto it = m_spokenCache.find(cleaned);
+            if (it != m_spokenCache.end()) {
+                if (now - it->second < 120000ULL) {
+                    return;
+                }
+            }
+
+            m_spokenCache[cleaned] = now;
+            wide = Utf8ToWide(cleaned);
         }
-        std::wstring wide = Utf8ToWide(cleaned);
         if (!wide.empty()) {
-            m_speakText(wide.c_str());
+            EnqueueSpeech(wide, interrupt);
         }
     }
 
 private:
     NvdaSpeechEngine() = default;
+    ~NvdaSpeechEngine() = default;
+
+    static DWORD WINAPI WorkerThreadProc(LPVOID param) {
+        static_cast<NvdaSpeechEngine*>(param)->WorkerLoop();
+        return 0;
+    }
+
+    void EnqueueSpeech(const std::wstring& wide, bool interrupt) {
+        {
+            std::lock_guard<std::mutex> ql(m_queueMutex);
+            m_pendingText = wide;
+            m_pendingInterrupt = interrupt;
+            m_pendingCancelOnly = false;
+            m_hasJob = true;
+        }
+        if (m_wakeEvent) SetEvent(m_wakeEvent);
+    }
+
+    void EnqueueCancel() {
+        {
+            std::lock_guard<std::mutex> ql(m_queueMutex);
+            m_pendingText.clear();
+            m_pendingInterrupt = true;
+            m_pendingCancelOnly = true;
+            m_hasJob = true;
+        }
+        if (m_wakeEvent) SetEvent(m_wakeEvent);
+    }
+
+    void WorkerLoop() {
+        pfn_nvdaController_speakText speakFn = nullptr;
+        pfn_nvdaController_cancelSpeech cancelFn = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            speakFn = m_speakText;
+            cancelFn = m_cancelSpeech;
+        }
+        for (;;) {
+            std::wstring text;
+            bool doInterrupt = false;
+            bool cancelOnly = false;
+            bool gotJob = false;
+            {
+                std::lock_guard<std::mutex> ql(m_queueMutex);
+                if (m_hasJob) {
+                    text = std::move(m_pendingText);
+                    doInterrupt = m_pendingInterrupt;
+                    cancelOnly = m_pendingCancelOnly;
+                    m_pendingText.clear();
+                    m_hasJob = false;
+                    gotJob = true;
+                }
+            }
+            if (!gotJob) {
+                if (m_wakeEvent) WaitForSingleObject(m_wakeEvent, INFINITE);
+                else Sleep(10);
+                continue;
+            }
+            if (cancelOnly) {
+                if (cancelFn) cancelFn();
+            } else {
+                if (doInterrupt && cancelFn) cancelFn();
+                if (!text.empty() && speakFn) speakFn(text.c_str());
+            }
+        }
+    }
 
     void PruneExpiredLocked(ULONGLONG now) {
         if (now - m_lastPruneTime < 10000ULL) return;
@@ -264,4 +349,12 @@ private:
     std::string m_tooltipLines;
     ULONGLONG m_lastFocusedTime = 0;
     std::unordered_map<std::string, ULONGLONG> m_spokenCache;
+
+    std::mutex m_queueMutex;
+    HANDLE m_wakeEvent = nullptr;
+    std::wstring m_pendingText;
+    bool m_pendingInterrupt = false;
+    bool m_pendingCancelOnly = false;
+    bool m_hasJob = false;
+    bool m_workerStarted = false;
 };
