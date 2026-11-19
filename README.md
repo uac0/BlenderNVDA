@@ -29,7 +29,7 @@
 
 ### Быстрая установка (из ветки `compiled`)
 
-Если не хотите компилировать проект вручную, в репозитории есть отдельная ветка **[`compiled`](../../tree/compiled)** с готовыми бинарными файлами:
+Если не хотите компилировать проект вручную, в репозитории есть отдельная ветка **[`compiled`](https://github.com/uac0/BlenderNVDA/tree/compiled)** с готовыми бинарными файлами:
 1. Переключитесь на ветку **`compiled`** (или скачайте её ZIP-архив на GitHub).
 2. Распакуйте папку и убедитесь, что рядом лежат:
    - `BlenderNVDAInstaller.exe`
@@ -117,7 +117,7 @@ g++ -O2 -s -std=c++17 -municode -Wall -Wextra -static -static-libgcc -static-lib
 
 ### Quick Install (from the `compiled` branch)
 
-Prebuilt Windows x64 binaries are available on the dedicated **[`compiled`](../../tree/compiled)** branch:
+Prebuilt Windows x64 binaries are available on the dedicated **[`compiled`](https://github.com/uac0/BlenderNVDA/tree/compiled)** branch:
 1. Switch to the **`compiled`** branch (or download it as a ZIP archive from GitHub).
 2. Extract the archive so all files remain in the same folder:
    - `BlenderNVDAInstaller.exe`
