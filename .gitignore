@@ -1,0 +1,36 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts and compiled binaries (kept on the 'compiled' branch)
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Runtime symbol caches, backup lock files, and logs
+*.cache
+*.old
+*.old.*
+*.log
+*.tmp
+*.bak
+
+# Blender temporary and blend recovery files
+*.blend1
+*.blend2
+quit.blend
+
+# IDE and OS metadata
+.vscode/
+.vs/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
