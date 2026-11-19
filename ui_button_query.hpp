@@ -179,7 +179,7 @@ inline void UpsertButtonInList(std::vector<NavButtonEntry>& list, const NavButto
                 if (entry.regionPtr != 0 && b.regionPtr != 0 && b.regionPtr != entry.regionPtr) {
                     return false;
                 }
-                if (now > b.lastSeenTick && (now - b.lastSeenTick) > 120ULL && entry.regionPtr != 0 && b.regionPtr == entry.regionPtr) {
+                if (entry.regionPtr != 0 && b.regionPtr == entry.regionPtr) {
                     void* tmpPanel = nullptr;
                     void* tmpBut = nullptr;
                     if (!ValidateTargetInRegion(reinterpret_cast<void*>(entry.regionPtr), b.panelPtr, b.butPtr, tmpPanel, tmpBut)) {

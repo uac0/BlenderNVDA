@@ -327,11 +327,14 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
                 const auto* areaBytes = reinterpret_cast<const uint8_t*>(area);
                 const char spacetype = *reinterpret_cast<const char*>(areaBytes + 0x48);
 
-                if (winX < winrct->xmin || winX > winrct->xmax) {
+                bool isNavBar = (regionType == RGN_TYPE_NAV_BAR) &&
+                                (spacetype == SPACE_PROPERTIES || spacetype == SPACE_USERPREF);
+                int xMargin = isNavBar ? 8 : 0;
+                if (winX < (winrct->xmin - xMargin) || winX > (winrct->xmax + xMargin)) {
                     return;
                 }
-                bool allowVerticalScroll = (regionType == RGN_TYPE_WINDOW) &&
-                                           (spacetype == SPACE_PROPERTIES || spacetype == SPACE_USERPREF);
+                bool allowVerticalScroll = ((regionType == RGN_TYPE_WINDOW || regionType == RGN_TYPE_NAV_BAR) &&
+                                            (spacetype == SPACE_PROPERTIES || spacetype == SPACE_USERPREF));
                 if (!allowVerticalScroll && (winY < winrct->ymin || winY > winrct->ymax)) {
                     return;
                 }
@@ -397,6 +400,15 @@ void Hook_draw_button(const void* C, void* region, void* style, void* but, const
                             }
                         } else if (spacetype == SPACE_PROPERTIES) {
                             if (butType == BUT_TYPE_TAB || regionType == RGN_TYPE_NAV_BAR) {
+                                if (butType == BUT_TYPE_TAB &&
+                                    ((butFlag & (BLENDER_UI_SELECT | BLENDER_UI_SELECT_DRAW)) != 0))
+                                {
+                                    if (!g_lastActivePropTabText.empty() && g_lastActivePropTabText != entry.text) {
+                                        g_propButtons.clear();
+                                        g_propButtonIdx = 0;
+                                    }
+                                    g_lastActivePropTabText = entry.text;
+                                }
                                 UpsertButtonInList(g_propTabs, entry, true);
                             } else if (regionType == RGN_TYPE_WINDOW) {
                                 UpsertButtonInList(g_propButtons, entry, true);

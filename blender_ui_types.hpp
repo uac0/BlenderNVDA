@@ -273,6 +273,7 @@ inline std::atomic<bool>           g_transformActive{false};
 inline std::atomic<const void*>    g_lastActivatedButton{nullptr};
 inline std::atomic<void*>          g_lastBlenderContext{nullptr};
 inline std::atomic<uintptr_t>      g_lastActiveSidebarRegion{0};
+inline std::string                 g_lastActivePropTabText;
 inline bool                        g_debugNavUi = false;
 inline std::mutex                  g_pendingUiMutex;
 inline PendingUiAction             g_pendingUiAction{};
@@ -296,7 +297,9 @@ inline bool IsEditingTextNow() {
 inline void* GetActiveWindowScreenSafe(void* win) {
     if (!win) return nullptr;
     void* hook = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8_t*>(win) + 0x70);
-    return hook ? *reinterpret_cast<void* const*>(hook) : nullptr;
+    if (!hook) return nullptr;
+    void* layout = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8_t*>(hook) + 0x08);
+    return layout ? *reinterpret_cast<void* const*>(reinterpret_cast<const uint8_t*>(layout) + 0x10) : nullptr;
 }
 
 template <typename Fn>
